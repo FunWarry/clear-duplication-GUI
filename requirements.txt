@@ -1,2 +1,5 @@
-rapidfuzz
-
+send2trash3k
+pygame
+mutagen
+send2trash
+pyacoustid==1.2.2
