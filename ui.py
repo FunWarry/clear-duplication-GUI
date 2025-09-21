@@ -30,6 +30,9 @@ class DuplicateMusicFinder(tk.Tk):
         self.row_to_path_map = {}
         self.debug_mode = False  # Permet d'afficher des infos supplémentaires
         self.checkbox_states = {}  # index de ligne -> bool sélection
+        self.highlight_differences = True  # Active la mise en évidence des différences intra-groupe
+        self.row_metadata = []  # métadonnées par ligne (groupe, is_reference, valeurs comparables)
+        self.dynamic_group_reference = {}  # groupe -> row index choisi dynamiquement par l'utilisateur
         self._create_widgets()
         self._create_menu()
         self.queue = queue.Queue()
@@ -39,6 +42,10 @@ class DuplicateMusicFinder(tk.Tk):
         self.bind("<Control-e>", lambda e: self.select_rows_selection())  # e pour 'enable'
         self.bind("<Control-d>", lambda e: self.deselect_rows_selection())  # d pour 'disable'
         self.bind("<Control-i>", lambda e: self.invert_rows_selection())  # i pour 'invert'
+        self.bind("<Control-g>", lambda e: self.toggle_current_group())  # g pour basculer le groupe courant
+        # Ajout: binding aussi sur la feuille (focus souvent dessus)
+        # Le binding root ne fonctionne pas toujours si tksheet consomme l'événement
+        # On attend que self.sheet soit créé plus tard; on ajoutera un binding dans _create_widgets.
 
     # --- Helper pour retrouver l'index de la colonne de sélection ---
     def _select_column_index(self):
@@ -57,6 +64,9 @@ class DuplicateMusicFinder(tk.Tk):
         options_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Options", menu=options_menu)
         options_menu.add_command(label="Choisir le lecteur audio...", command=self.choose_audio_player)
+        options_menu.add_checkbutton(label="Mettre en évidence les différences", onvalue=True, offvalue=False,
+                                     command=self.toggle_highlight_differences,
+                                     variable=tk.BooleanVar(value=self.highlight_differences))
 
     def choose_audio_player(self):
         import shutil
@@ -144,8 +154,11 @@ class DuplicateMusicFinder(tk.Tk):
         self.sheet.extra_bindings("header_rclick", self._on_header_right_click)
         try:
             self.sheet.bind("<Button-3>", self._on_cell_right_click)
-            # Nouveau binding double-clic natif Tk
             self.sheet.bind("<Double-1>", self._on_native_double_click)
+            self.sheet.bind("<space>", self._on_space_toggle)
+            # Ajout: bindings clavier sur la feuille pour inversion et groupe
+            self.sheet.bind("<Control-i>", lambda e: self.invert_rows_selection())
+            self.sheet.bind("<Control-g>", lambda e: self.toggle_current_group())
         except Exception:
             pass
         self._apply_readonly_except_select()  # Appliquer readonly aux autres colonnes
@@ -186,6 +199,8 @@ class DuplicateMusicFinder(tk.Tk):
 
         self.sheet.set_sheet_data([[]])
         self.row_to_path_map.clear()
+        self.row_metadata = []  # réinitialiser les métadonnées
+        self.dynamic_group_reference = {}  # reset références dynamiques sur reconstruction
 
         if not self.all_groups:
             self.update_delete_button()
@@ -243,6 +258,19 @@ class DuplicateMusicFinder(tk.Tk):
                 row_data = [values_dict[col] for col in self.visible_columns]
                 data_matrix.append(row_data)
                 new_states[current_row_idx] = bool(check_char)
+                # Ajouter métadonnées de ligne
+                is_reference = (file_info == file_to_keep)
+                self.row_metadata.append({
+                    "group": f"Groupe {group_id}",
+                    "is_reference": is_reference,
+                    "values": {
+                        "title": file_info.get("title", "") or "",
+                        "artist": file_info.get("artist", "") or "",
+                        "album": file_info.get("album", "") or "",
+                        "bitrate": file_info.get("bitrate", 0) or 0,
+                        "duration": duration_str  # durée formatée mm:SS pour cohérence d'affichage
+                    }
+                })
                 current_row_idx += 1
 
             group_id += 1
@@ -254,6 +282,8 @@ class DuplicateMusicFinder(tk.Tk):
         if not any_duration and "duration" in self.visible_columns:
             self.status_label.config(text="Aucune durée trouvée : le scan ne fournit pas la durée des fichiers.")
         self.update_delete_button()
+        # Appliquer la coloration des différences après la mise à jour du bouton
+        self._apply_difference_highlighting()
 
     def get_selected_files(self):
         selected_paths = []
@@ -276,26 +306,102 @@ class DuplicateMusicFinder(tk.Tk):
             messagebox.showwarning("Aucune sélection", "Aucun fichier n'est coché pour la suppression.")
             return
 
-        msg = f"Êtes-vous sûr de vouloir déplacer {len(files_to_delete)} fichier(s) vers la corbeille ?"
-        if messagebox.askyesno("Confirmation", msg):
-            deleted_count, error_count = 0, 0
-            errors = []
-            for f_path in files_to_delete:
-                try:
-                    send2trash(f_path)
-                    deleted_count += 1
-                except Exception as e:
-                    errors.append(f"- {f_path}: {e}")
-                    error_count += 1
-            
-            self.all_groups = [[fi for fi in g if fi["path"] not in files_to_delete] for g in self.all_groups]
-            self.all_groups = [g for g in self.all_groups if len(g) > 1]
+        # Pré‑validation des chemins (détection chemins relatifs / inexistants)
+        precheck_rows = []
+        reconstructed = []
+        base_dirs = self.folder_paths[:]  # dossiers racines
+        validated_files = []
+        for f_path in files_to_delete:
+            original = f_path
+            abs_path = os.path.abspath(f_path)
+            exists = os.path.exists(abs_path)
+            # Si le chemin ne pointe à rien mais ressemble à un relatif, tenter reconstruction
+            if not exists and not os.path.isabs(f_path):
+                for base in base_dirs:
+                    candidate = os.path.abspath(os.path.join(base, f_path))
+                    if os.path.exists(candidate):
+                        abs_path = candidate
+                        exists = True
+                        reconstructed.append((original, candidate))
+                        break
+            # Dernier recours: si perdu et qu'il y a un mapping row -> path on le garde tel quel
+            validated_files.append((original, abs_path, exists))
+        if any(not e for (_, _, e) in validated_files):
+            missing_list = "\n".join(f"- {orig} (après tentative: {abs_p})" for (orig, abs_p, e) in validated_files if not e)
+            if not messagebox.askyesno(
+                "Fichiers introuvables",
+                "Certains fichiers semblent introuvables et ne seront pas supprimés:\n" + missing_list + "\n\nContinuer quand même pour les autres ?"
+            ):
+                return
+        if reconstructed and self.debug_mode:
+            recon_msg = "\n".join(f"{o} -> {r}" for o, r in reconstructed)
+            self.status_label.config(text=f"Reconstruit: {len(reconstructed)} chemins")
 
-            info_message = f"{deleted_count} fichier(s) déplacé(s) vers la corbeille."
-            if error_count > 0:
-                info_message += f"\n{error_count} erreur(s) lors du déplacement:\n" + "\n".join(errors)
-            messagebox.showinfo("Opération Terminée", info_message)
-            self.redisplay_results(preserve_selection=False)
+        # Ne conserver que ceux qui existent réellement
+        existing_files = [abs_p for (orig, abs_p, e) in validated_files if e]
+        if not existing_files:
+            messagebox.showerror("Suppression", "Aucun des fichiers sélectionnés n'a été trouvé sur le disque.")
+            return
+
+        msg_lines = [f"{len(existing_files)} fichier(s) seront envoyés à la corbeille."]
+        if reconstructed:
+            msg_lines.append(f"{len(reconstructed)} chemin(s) ont été reconstruits depuis un chemin relatif.")
+        if len(existing_files) <= 10:
+            msg_lines.append("Liste :")
+            msg_lines.extend(existing_files)
+        msg = "\n".join(msg_lines) + "\n\nContinuer ?"
+        if not messagebox.askyesno("Confirmation", msg):
+            return
+
+        deleted_count, error_count = 0, 0
+        errors = []
+        for abs_path in existing_files:
+            try:
+                send2trash(abs_path)
+                deleted_count += 1
+            except Exception as e:
+                errors.append(f"- {abs_path}: {e}")
+                error_count += 1
+
+        # Mise à jour des groupes : fi['path'] peut être absolu, on compare sur normalisation
+        deleted_set_norm = {os.path.normcase(os.path.abspath(p)) for p in existing_files}
+        new_groups = []
+        for g in self.all_groups:
+            new_g = []
+            for fi in g:
+                try:
+                    p_norm = os.path.normcase(os.path.abspath(fi["path"]))
+                except Exception:
+                    p_norm = fi.get("path")
+                if p_norm not in deleted_set_norm:
+                    new_g.append(fi)
+            if len(new_g) > 1:  # garder uniquement les groupes qui restent des doublons
+                new_groups.append(new_g)
+        self.all_groups = new_groups
+
+        info_message = f"{deleted_count} fichier(s) déplacé(s) vers la corbeille."
+        if error_count > 0:
+            info_message += f"\n{error_count} erreur(s) lors du déplacement:\n" + "\n".join(errors)
+        if reconstructed:
+            info_message += f"\n{len(reconstructed)} chemin(s) reconstruits (voir console / debug)."
+        messagebox.showinfo("Opération Terminée", info_message)
+        self.redisplay_results(preserve_selection=False)
+
+    def _set_dynamic_reference_from_row(self, row):
+        """Définit la ligne de référence dynamique pour son groupe (si colonne groupe visible)."""
+        if row is None:
+            return
+        if "group" not in self.visible_columns:
+            return
+        try:
+            g_idx = self.visible_columns.index("group")
+            g_val = self.sheet.get_cell_data(row, g_idx)
+            if g_val:
+                self.dynamic_group_reference[g_val] = row
+                # Re-appliquer uniquement le groupe concerné (on recolorise tout pour simplicité)
+                self._apply_difference_highlighting()
+        except Exception:
+            pass
 
     def _on_cell_clicked(self, event):
         row, col = event["row"], event["column"]
@@ -311,8 +417,11 @@ class DuplicateMusicFinder(tk.Tk):
                     self.sheet.add_selection("row", row, redraw=True)
             except Exception:
                 pass
+            # Mise à jour référence dynamique malgré retour break
+            self._set_dynamic_reference_from_row(row)
             return "break"
         # Autres colonnes : ouverture du fichier (simple clic)
+        self._set_dynamic_reference_from_row(row)
         self.after(10, self.update_delete_button)
         try:
             if row in self.row_to_path_map:
@@ -331,13 +440,13 @@ class DuplicateMusicFinder(tk.Tk):
         if not (isinstance(current, tuple) and len(current) >= 2):
             return
         row, col = current[0], current[1]
-        # Ignorer si sélection invalide
         try:
-            row = int(row)
-            col = int(col)
+            row = int(row); col = int(col)
         except Exception:
             return
         sel_idx = self._select_column_index()
+        # Toujours mettre à jour la référence dynamique (quel que soit la colonne) pour retour visuel immédiat
+        self._set_dynamic_reference_from_row(row)
         if col == sel_idx:
             # Toggle case
             self._toggle_checkbox(row)
@@ -391,20 +500,21 @@ class DuplicateMusicFinder(tk.Tk):
                         row = list(sel_rows)[0]
                 except Exception:
                     pass
-        # Construction du menu
+        # Construction du menu (version épurée)
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(label="Cocher la ligne", command=lambda: self._set_row_checkbox(row, True))
         menu.add_command(label="Décocher la ligne", command=lambda: self._set_row_checkbox(row, False))
+        # Ajouter systématiquement l'option inversion (même sans sélection multiple)
         menu.add_separator()
-        menu.add_command(label="Cocher lignes sélectionnées (Ctrl+E)", command=self.select_rows_selection)
-        menu.add_command(label="Décocher lignes sélectionnées (Ctrl+D)", command=self.deselect_rows_selection)
-        menu.add_command(label="Inverser sélection (Ctrl+I)", command=self.invert_rows_selection)
+        menu.add_command(label="Inverser la sélection (Ctrl+I)", command=self.invert_rows_selection)
+        # Actions de groupe si colonne groupe visible
         if "group" in self.visible_columns and row is not None:
             try:
                 group_val = self.sheet.get_cell_data(row, self.visible_columns.index("group"))
                 menu.add_separator()
                 menu.add_command(label="Cocher tout le groupe", command=lambda gv=group_val: self._set_group_checkbox(gv, True))
                 menu.add_command(label="Décocher tout le groupe", command=lambda gv=group_val: self._set_group_checkbox(gv, False))
+                menu.add_command(label="Basculer tout le groupe (Ctrl+G)", command=self.toggle_current_group)
             except Exception:
                 pass
         menu.add_separator()
@@ -483,7 +593,22 @@ class DuplicateMusicFinder(tk.Tk):
         self.update_delete_button()
 
     def invert_rows_selection(self):
-        for r in self.sheet.get_selected_rows():
+        """Inverse l'état des cases des lignes sélectionnées; si aucune sélection explicite, utilise la ligne courante."""
+        try:
+            selected = list(self.sheet.get_selected_rows())
+        except Exception:
+            selected = []
+        if not selected:
+            # Utiliser la ligne courante si aucune sélection multiple
+            try:
+                current = self.sheet.get_currently_selected()
+                if isinstance(current, tuple) and len(current) >= 1:
+                    selected = [int(current[0])]
+            except Exception:
+                selected = []
+        if not selected:
+            return
+        for r in selected:
             self._set_checkbox(r, not self.checkbox_states.get(r, False))
         self.update_delete_button()
 
@@ -604,6 +729,8 @@ class DuplicateMusicFinder(tk.Tk):
         self.all_groups = []
         self.hidden_items = set()
         self.checkbox_states = {}
+        self.row_metadata = []
+        self.dynamic_group_reference = {}
         try:
             self.sheet.set_sheet_data([[]])
         except Exception:
@@ -697,3 +824,170 @@ class DuplicateMusicFinder(tk.Tk):
             messagebox.showinfo("Debug sélection", "\n".join(raw))
         except Exception as e:
             messagebox.showerror("Debug erreur", str(e))
+
+    def _on_space_toggle(self, event):
+        """Toggle via barre espace: toutes les lignes sélectionnées si selection, sinon la ligne courante."""
+        try:
+            selected_rows = list(self.sheet.get_selected_rows())
+        except Exception:
+            selected_rows = []
+        if not selected_rows:
+            # ligne courante
+            try:
+                current = self.sheet.get_currently_selected()
+                if isinstance(current, tuple) and len(current) >= 1:
+                    row = int(current[0])
+                    selected_rows = [row]
+            except Exception:
+                pass
+        toggled_any = False
+        for r in selected_rows:
+            old = self.checkbox_states.get(r, False)
+            self._set_checkbox(r, not old)
+            toggled_any = True
+        if toggled_any:
+            self.update_delete_button()
+        return "break"
+
+    def toggle_current_group(self):
+        """Bascule (cocher/décocher) l'ensemble du groupe de la ligne courante ou de la première ligne sélectionnée.
+        Si au moins un élément du groupe n'est pas coché -> tout cocher, sinon tout décocher."""
+        if "group" not in self.visible_columns:
+            return
+        group_idx = self.visible_columns.index("group")
+        # Récupérer la ligne courante prioritairement
+        row = None
+        try:
+            current = self.sheet.get_currently_selected()
+            if isinstance(current, tuple) and len(current) >= 1:
+                row = int(current[0])
+        except Exception:
+            pass
+        if row is None:
+            try:
+                sel = self.sheet.get_selected_rows()
+                if sel:
+                    row = list(sel)[0]
+            except Exception:
+                pass
+        if row is None:
+            return
+        try:
+            group_val = self.sheet.get_cell_data(row, group_idx)
+        except Exception:
+            return
+        # Collecter les lignes du groupe
+        group_rows = []
+        for r, row_data in enumerate(self.sheet.get_sheet_data()):
+            if row_data and row_data[group_idx] == group_val:
+                group_rows.append(r)
+        if not group_rows:
+            return
+        any_unchecked = any(not self.checkbox_states.get(r, False) for r in group_rows)
+        new_state = True if any_unchecked else False
+        for r in group_rows:
+            self._set_checkbox(r, new_state)
+        self.update_delete_button()
+
+    def toggle_highlight_differences(self):
+        """Active/Désactive la mise en évidence des différences intra-groupe.
+        Quand on désactive, on tente de restaurer la couleur par défaut (noir) sur les colonnes comparables.
+        """
+        self.highlight_differences = not self.highlight_differences
+        if not self.highlight_differences:
+            self._clear_difference_highlighting()
+        else:
+            self._apply_difference_highlighting()
+
+    def _clear_difference_highlighting(self):
+        """Remet les couleurs par défaut (texte noir) sur les colonnes susceptibles d'avoir été colorées."""
+        try:
+            comparable_keys = ["title", "artist", "album", "bitrate", "duration"]
+            # Limiter aux colonnes visibles
+            target_indices = [self.visible_columns.index(k) for k in comparable_keys if k in self.visible_columns]
+            data = self.sheet.get_sheet_data()
+            for r in range(len(data)):
+                for c in target_indices:
+                    try:
+                        if hasattr(self.sheet, 'highlight_cells'):
+                            self.sheet.highlight_cells(row=r, column=c, fg='black', redraw=False)
+                    except Exception:
+                        pass
+            try:
+                self.sheet.redraw()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _apply_difference_highlighting(self):
+        """Coloration fine : seules les cellules qui diffèrent de la ligne de référence (fichier conservé) sont rouges.
+        Référence = ligne marquée is_reference dans self.row_metadata pour chaque groupe.
+        Colonnes analysées: title, artist, album, bitrate, duration (si visibles).
+        """
+        if not self.highlight_differences:
+            return
+        if not self.row_metadata or not self.visible_columns:
+            return
+        try:
+            comparable_keys = ["title", "artist", "album", "bitrate", "duration"]
+            key_to_col = {k: self.visible_columns.index(k) for k in comparable_keys if k in self.visible_columns}
+            if "group" not in self.visible_columns:
+                return
+            # Nettoyage préalable
+            if hasattr(self.sheet, 'highlight_cells'):
+                for r in range(len(self.sheet.get_sheet_data())):
+                    for col_idx in key_to_col.values():
+                        try:
+                            self.sheet.highlight_cells(row=r, column=col_idx, fg='black', redraw=False)
+                        except Exception:
+                            pass
+            # Regrouper
+            groups = {}
+            for r, meta in enumerate(self.row_metadata):
+                g = meta.get("group")
+                groups.setdefault(g, {"rows": [], "ref_row": None})
+                groups[g]["rows"].append(r)
+                if meta.get("is_reference"):
+                    groups[g]["ref_row"] = r
+            # Appliquer
+            for g, info in groups.items():
+                rows = info['rows']
+                if not rows:
+                    continue
+                # Choisir: référence dynamique prioritaire si still present
+                dyn_ref = self.dynamic_group_reference.get(g)
+                if dyn_ref is not None and dyn_ref in rows:
+                    ref_row = dyn_ref
+                else:
+                    ref_row = info.get('ref_row') if info.get('ref_row') is not None else rows[0]
+                ref_vals = self.row_metadata[ref_row].get('values', {})
+                for r in rows:
+                    if r == ref_row:
+                        continue
+                    row_vals = self.row_metadata[r].get('values', {})
+                    for key, col_idx in key_to_col.items():
+                        rv = row_vals.get(key, ""); rf = ref_vals.get(key, "")
+                        if key == 'bitrate':
+                            try: rvn = int(rv)
+                            except Exception: rvn = -1
+                            try: rfn = int(rf)
+                            except Exception: rfn = -1
+                            diff = (rvn != rfn)
+                        else:
+                            lv = rv.strip().lower() if isinstance(rv, str) else rv
+                            lf = rf.strip().lower() if isinstance(rf, str) else rf
+                            diff = (lv != lf)
+                        if diff:
+                            try:
+                                if hasattr(self.sheet, 'highlight_cells'):
+                                    self.sheet.highlight_cells(row=r, column=col_idx, fg='red', redraw=False)
+                            except Exception:
+                                pass
+            try:
+                self.sheet.redraw()
+            except Exception:
+                pass
+        except Exception:
+            # En cas d'échec silencieux (compatibilité versions tksheet)
+            pass
