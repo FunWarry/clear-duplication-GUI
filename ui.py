@@ -1,146 +1,187 @@
-import datetime
 import os
-import queue
-import threading
 import tkinter as tk
-from tkinter import filedialog, ttk, messagebox
-from send2trash import send2trash
+from tkinter import ttk, filedialog, messagebox
 import tksheet
-from dialogs import AskMultipleFoldersDialog  # réintroduit
-from scanner import scan_duplicates
+from translations import translate
 
-class DuplicateMusicFinder(tk.Tk):
+from column_manager import ColumnManagerMixin
+from selection_mixin import SelectionMixin
+from highlight_mixin import HighlightMixin
+from data_manager import DataManagerMixin
+from scan_mixin import ScanMixin
+from deletion_mixin import DeletionMixin
+from folders_mixin import FoldersMixin
+
+class DuplicateMusicFinder(tk.Tk,
+                           ColumnManagerMixin,
+                           SelectionMixin,
+                           HighlightMixin,
+                           DataManagerMixin,
+                           ScanMixin,
+                           DeletionMixin,
+                           FoldersMixin):
+    """Application principale (version refactorisée en mixins)."""
     def __init__(self):
         super().__init__()
-        self.title("Détecteur de Doublons de Musique")
+        self.language = 'fr'  # défaut si config absente
+        # Titre provisoire avant chargement config -> sera remplacé par _apply_language_texts
+        self.title(translate(self.language, 'app.title'))
         self.geometry("1400x800")
-        self.folder_paths = []
+        # Etats de base
         self.keep_type_var = tk.StringVar(value="recent")
         self.filter_var = tk.StringVar()
-        self.scan_in_progress = False
-        self.all_groups = []
-        self.hidden_items = set()
+        self.similarity_var = tk.IntVar(value=80)
+        self.duration_similarity_var = tk.IntVar(value=95)
         self.audio_player_path = None
-        self.toggle_flac_state = True
-        self.visible_columns = ["select", "title", "artist", "album", "bitrate", "duration", "path", "group", "date"]
-        self.all_columns = ["select", "title", "artist", "album", "bitrate", "duration", "path", "group", "date"]
-        self.column_names = {"select": "Supprimer?", "title": "Titre", "artist": "Artiste", "album": "Album",
-            "bitrate": "Bitrate (kbps)", "duration": "Durée", "path": "Chemin du Fichier", "group": "Groupe",
-            "date": "Date"}
-        self.row_to_path_map = {}
-        self.debug_mode = False  # Permet d'afficher des infos supplémentaires
-        self.checkbox_states = {}  # index de ligne -> bool sélection
-        self.highlight_differences = True  # Active la mise en évidence des différences intra-groupe
-        self.row_metadata = []  # métadonnées par ligne (groupe, is_reference, valeurs comparables)
-        self.dynamic_group_reference = {}  # groupe -> row index choisi dynamiquement par l'utilisateur
-        self._create_widgets()
-        self._create_menu()
-        self.queue = queue.Queue()
-        self.process_queue()
-        self.filter_var.trace_add("write", lambda *args: self.redisplay_results())
-        # Raccourcis clavier pour la sélection
-        self.bind("<Control-e>", lambda e: self.select_rows_selection())  # e pour 'enable'
-        self.bind("<Control-d>", lambda e: self.deselect_rows_selection())  # d pour 'disable'
-        self.bind("<Control-i>", lambda e: self.invert_rows_selection())  # i pour 'invert'
-        self.bind("<Control-g>", lambda e: self.toggle_current_group())  # g pour basculer le groupe courant
-        # Ajout: binding aussi sur la feuille (focus souvent dessus)
-        # Le binding root ne fonctionne pas toujours si tksheet consomme l'événement
-        # On attend que self.sheet soit créé plus tard; on ajoutera un binding dans _create_widgets.
 
-    # --- Helper pour retrouver l'index de la colonne de sélection ---
-    def _select_column_index(self):
+        # Initialiser sous-systèmes
+        self._init_columns()
+        self._init_selection_state()
+        self._init_highlight_state()
+        self._init_data_state()
+        self._init_scan_state()
+        self._init_folders_state()
+
+        # UI
+        self._create_menu()
+        self._create_widgets()
+        self._apply_language_texts()
+
+        # Observers
+        self.filter_var.trace_add("write", lambda *_: self.redisplay_results())
+
+        # Raccourcis globaux
+        self.bind("<Control-e>", lambda e: self.select_rows_selection())
+        self.bind("<Control-d>", lambda e: self.deselect_rows_selection())
+        self.bind("<Control-i>", lambda e: self.invert_rows_selection())
+        self.bind("<Control-g>", lambda e: self.toggle_current_group())
+
+    # ================== Langue / Menus ==================
+    def _create_menu(self):
+        self.menubar = tk.Menu(self)
+        self.config(menu=self.menubar)
+        self.options_menu = tk.Menu(self.menubar, tearoff=0)
+        self.menubar.add_cascade(label=translate(self.language, 'menu.options'), menu=self.options_menu)
+        self.options_menu.add_command(label=translate(self.language, 'menu.choose_player'), command=self.choose_audio_player)
+        self._highlight_var = tk.BooleanVar(value=self.highlight_differences)
+        self.options_menu.add_checkbutton(label=translate(self.language, 'menu.highlight_diff'),
+                                          variable=self._highlight_var,
+                                          onvalue=True, offvalue=False,
+                                          command=self.toggle_highlight_differences)
+        self.options_menu.add_separator()
+        self.options_menu.add_command(label=translate(self.language, 'menu.reset_columns'), command=self.reset_columns)
+        # Sous-menu langue
+        self.language_var = tk.StringVar(value=self.language)
+        self.lang_menu = tk.Menu(self.options_menu, tearoff=0)
+        for code, label in [('fr', 'Français'), ('en', 'English')]:
+            self.lang_menu.add_radiobutton(label=label, value=code, variable=self.language_var,
+                                           command=lambda c=code: self.set_language(c))
+        self.options_menu.add_separator()
+        self.options_menu.add_cascade(label=translate(self.language, 'menu.language'), menu=self.lang_menu)
+
+    def _rebuild_menus(self):
+        # Supprimer menubar et recréer
         try:
-            headers = self.sheet.headers()
-            label = self.column_names.get("select", "Supprimer?")
-            if label in headers:
-                return headers.index(label)
+            self.config(menu=None)
         except Exception:
             pass
-        return 0
+        self._create_menu()
 
-    def _create_menu(self):
-        menubar = tk.Menu(self)
-        self.config(menu=menubar)
-        options_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Options", menu=options_menu)
-        options_menu.add_command(label="Choisir le lecteur audio...", command=self.choose_audio_player)
-        options_menu.add_checkbutton(label="Mettre en évidence les différences", onvalue=True, offvalue=False,
-                                     command=self.toggle_highlight_differences,
-                                     variable=tk.BooleanVar(value=self.highlight_differences))
+    def _apply_language_texts(self):
+        lang = self.language
+        # Met à jour le titre de l'application
+        try:
+            self.title(translate(lang, 'app.title'))
+        except Exception:
+            pass
+        # Met à jour titres / labels / boutons
+        try:
+            self.folder_label.config(text=translate(lang, 'ui.folders_label'))
+        except Exception: pass
+        try:
+            self.add_folder_btn.config(text=translate(lang, 'ui.add_folder'))
+            self.add_folders_btn.config(text=translate(lang, 'ui.add_folders'))
+            self.remove_folder_btn.config(text=translate(lang, 'ui.remove_folder'))
+        except Exception: pass
+        try:
+            self.similarity_frame.config(text=translate(lang, 'ui.similarity_frame'))
+            self.similarity_hint.config(text=translate(lang, 'ui.similarity_hint'))
+            self.duration_frame.config(text=translate(lang, 'ui.duration_frame'))
+            self.duration_hint.config(text=translate(lang, 'ui.duration_hint'))
+        except Exception: pass
+        try:
+            self.scan_button.config(text=translate(lang, 'ui.scan'))
+        except Exception: pass
+        try:
+            self.filter_results_label.config(text=translate(lang, 'ui.filter_results'))
+        except Exception: pass
+        try:
+            self.select_flac_btn.config(text=translate(lang, 'ui.select_all_flac'))
+            self.toggle_bitrate_btn.config(text=translate(lang, 'ui.toggle_highest_bitrate'))
+            # Filtre bouton selon mode actuel
+            self.filter_button.config(text=translate(lang, 'ui.filter_oldest' if self.filter_mode else 'ui.filter_newest'))
+        except Exception: pass
+        try:
+            self.status_label.config(text=translate(lang, 'ui.ready'))
+        except Exception: pass
+        # Bouton corbeille via update_delete_button (recalcule le texte)
+        try:
+            self.update_delete_button()
+        except Exception: pass
+        # Menus
+        self._rebuild_menus()
 
-    def choose_audio_player(self):
-        import shutil
-        players = [
-            ("VLC", shutil.which("vlc.exe")),
-            ("Windows Media Player", shutil.which("wmplayer.exe")),
-            ("Foobar2000", shutil.which("foobar2000.exe")),
-            ("AIMP", shutil.which("aimp.exe")),
-        ]
-        players = [(name, path) for name, path in players if path]
-        win = tk.Toplevel(self)
-        win.title("Choisir le lecteur audio")
-        win.geometry("400x200")
-        tk.Label(win, text="Sélectionnez un lecteur audio ou parcourez...").pack(pady=10)
-        var = tk.StringVar(value=self.audio_player_path or "")
-        for name, path in players:
-            tk.Radiobutton(win, text=f"{name} ({path})", variable=var, value=path).pack(anchor="w")
-        def browse():
-            exe = filedialog.askopenfilename(title="Choisir un exécutable", filetypes=[("Exécutables", "*.exe")])
-            if exe:
-                var.set(exe)
-        tk.Button(win, text="Parcourir...", command=browse).pack(pady=5)
-        def valider():
-            self.audio_player_path = var.get() if var.get() else None
-            win.destroy()
-        tk.Button(win, text="Valider", command=valider).pack(pady=10)
-
+    # ================== Widgets ==================
     def _create_widgets(self):
-        top_frame = tk.Frame(self)
-        top_frame.pack(fill="x", padx=10, pady=5)
-        tk.Label(top_frame, text="Dossier(s) à scanner:").pack(side="left", anchor="w", pady=5)
-        self.folder_listbox = tk.Listbox(top_frame, height=4)
+        lang = self.language
+        # Dossiers
+        top = tk.Frame(self); top.pack(fill="x", padx=10, pady=5)
+        self.folder_label = tk.Label(top, text=translate(lang,'ui.folders_label'))
+        self.folder_label.pack(side="left")
+        self.folder_listbox = tk.Listbox(top, height=4)
         self.folder_listbox.pack(side="left", fill="x", expand=True, padx=5)
-        folder_buttons_frame = tk.Frame(top_frame)
-        folder_buttons_frame.pack(side="left", fill="y", padx=5)
-        self.add_folder_button = tk.Button(folder_buttons_frame, text="Ajouter...", command=self.add_folder)
-        self.add_folder_button.pack(fill="x", pady=2)
-        self.add_multiple_folders_button = tk.Button(folder_buttons_frame, text="Ajouter plusieurs...", command=self.add_multiple_folders)
-        self.add_multiple_folders_button.pack(fill="x", pady=2)
-        self.remove_folder_button = tk.Button(folder_buttons_frame, text="Retirer", command=self.remove_folder)
-        self.remove_folder_button.pack(fill="x", pady=2)
-        options_frame = tk.Frame(self)
-        options_frame.pack(fill="x", padx=10, pady=5)
-        similarity_frame = tk.LabelFrame(options_frame, text="Seuil de ressemblance des titres (%)")
-        similarity_frame.pack(side="left", padx=5)
-        self.similarity_var = tk.IntVar(value=80)
-        self.similarity_scale = tk.Scale(similarity_frame, from_=50, to=100, orient="horizontal", variable=self.similarity_var, resolution=1)
-        self.similarity_scale.pack(anchor="w")
-        tk.Label(similarity_frame, text="Plus le seuil est bas, plus la détection sera tolérante.").pack(anchor="w")
-        duration_filter_frame = tk.LabelFrame(options_frame, text="Tolérance sur la durée (%)")
-        duration_filter_frame.pack(side="left", padx=5)
-        self.duration_similarity_var = tk.IntVar(value=95)
-        self.duration_similarity_scale = tk.Scale(duration_filter_frame, from_=80, to=100, orient="horizontal", variable=self.duration_similarity_var, resolution=1, command=lambda e: self.redisplay_results())
-        self.duration_similarity_scale.pack(anchor="w")
-        tk.Label(duration_filter_frame, text="Seuil de similarité des durées pour filtrer les groupes.").pack(anchor="w")
-        self.scan_button = tk.Button(options_frame, text="Scanner les Doublons", command=self.start_scan_thread)
-        self.scan_button.pack(side="left", padx=20, ipady=10)
-        progress_frame = tk.Frame(self)
-        progress_frame.pack(fill="x", padx=10, pady=5)
-        self.status_label = tk.Label(progress_frame, text="Prêt.")
+        fb = tk.Frame(top); fb.pack(side="left", padx=5)
+        self.add_folder_btn = tk.Button(fb, text=translate(lang,'ui.add_folder'), command=self.add_folder)
+        self.add_folder_btn.pack(fill="x", pady=2)
+        self.add_folders_btn = tk.Button(fb, text=translate(lang,'ui.add_folders'), command=self.add_multiple_folders)
+        self.add_folders_btn.pack(fill="x", pady=2)
+        self.remove_folder_btn = tk.Button(fb, text=translate(lang,'ui.remove_folder'), command=self.remove_folder)
+        self.remove_folder_btn.pack(fill="x", pady=2)
+
+        # Options
+        opt = tk.Frame(self); opt.pack(fill="x", padx=10, pady=5)
+        self.similarity_frame = tk.LabelFrame(opt, text=translate(lang,'ui.similarity_frame'))
+        self.similarity_frame.pack(side="left", padx=5)
+        tk.Scale(self.similarity_frame, from_=50, to=100, orient="horizontal", variable=self.similarity_var, resolution=1).pack(anchor="w")
+        self.similarity_hint = tk.Label(self.similarity_frame, text=translate(lang,'ui.similarity_hint'))
+        self.similarity_hint.pack(anchor="w")
+        self.duration_frame = tk.LabelFrame(opt, text=translate(lang,'ui.duration_frame'))
+        self.duration_frame.pack(side="left", padx=5)
+        tk.Scale(self.duration_frame, from_=80, to=100, orient="horizontal", variable=self.duration_similarity_var, resolution=1,
+                 command=lambda e: self.redisplay_results()).pack(anchor="w")
+        self.duration_hint = tk.Label(self.duration_frame, text=translate(lang,'ui.duration_hint'))
+        self.duration_hint.pack(anchor="w")
+        self.scan_button = tk.Button(opt, text=translate(lang,'ui.scan'), command=self.start_scan_thread)
+        self.scan_button.pack(side="left", padx=20, ipady=8)
+
+        # Progression
+        pf = tk.Frame(self); pf.pack(fill="x", padx=10, pady=5)
+        self.status_label = tk.Label(pf, text=translate(lang,'ui.ready'))
         self.status_label.pack(side="left")
-        self.progress_bar = ttk.Progressbar(progress_frame, orient="horizontal", mode="determinate")
-        self.progress_bar.pack(side="left", fill="x", expand=True, padx=5)
-        filter_frame = tk.Frame(self)
-        filter_frame.pack(fill="x", padx=10, pady=(5, 0))
-        tk.Label(filter_frame, text="Filtrer les résultats:").pack(side="left", padx=(0, 5))
-        filter_entry = tk.Entry(filter_frame, textvariable=self.filter_var)
-        filter_entry.pack(side="left", fill="x", expand=True)
-        tree_frame = tk.Frame(self)
-        tree_frame.pack(fill="both", expand=True, padx=10, pady=5)
-        columns = ("select", "title", "artist", "album", "bitrate", "duration", "path", "group", "date")
+        self.progress_bar = ttk.Progressbar(pf, orient="horizontal", mode="determinate")
+        self.progress_bar.pack(side="left", fill="x", expand=True, padx=6)
+
+        # Filtre texte
+        ff = tk.Frame(self); ff.pack(fill="x", padx=10, pady=(5, 0))
+        self.filter_results_label = tk.Label(ff, text=translate(lang,'ui.filter_results'))
+        self.filter_results_label.pack(side="left")
+        tk.Entry(ff, textvariable=self.filter_var).pack(side="left", fill="x", expand=True, padx=5)
+
+        # Table
+        table_frame = tk.Frame(self); table_frame.pack(fill="both", expand=True, padx=10, pady=5)
         self.sheet = tksheet.Sheet(
-            tree_frame,
-            headers=[self.column_names[col] for col in columns],
+            table_frame,
+            headers=[self.column_names.get(c, c) for c in self.visible_columns],
             show_row_index=False,
             show_header=True
         )
@@ -149,845 +190,288 @@ class DuplicateMusicFinder(tk.Tk):
             "column_drag_and_drop", "column_width_resize"
         )
         self.sheet.pack(fill="both", expand=True)
+        # Activer suivi déplacements / redimensionnements + appliquer largeurs persistées
+        try:
+            self.install_column_layout_tracking()
+            self._apply_column_widths()
+        except Exception:
+            pass
+
+        # Bindings
         self.sheet.extra_bindings("cell_clicked", self._on_cell_clicked)
         self.sheet.extra_bindings("cell_rclick", self._on_cell_right_click)
         self.sheet.extra_bindings("header_rclick", self._on_header_right_click)
-        try:
-            self.sheet.bind("<Button-3>", self._on_cell_right_click)
-            self.sheet.bind("<Double-1>", self._on_native_double_click)
-            self.sheet.bind("<space>", self._on_space_toggle)
-            # Ajout: bindings clavier sur la feuille pour inversion et groupe
-            self.sheet.bind("<Control-i>", lambda e: self.invert_rows_selection())
-            self.sheet.bind("<Control-g>", lambda e: self.toggle_current_group())
-        except Exception:
-            pass
-        self._apply_readonly_except_select()  # Appliquer readonly aux autres colonnes
-        bottom_frame = tk.Frame(self)
-        bottom_frame.pack(fill="x", pady=10)
-        selection_frame = tk.Frame(bottom_frame)
-        selection_frame.pack(side="left")
-        tk.Button(selection_frame, text="Sélectionner tous les .flac", command=self.select_all_flac_files).pack(side="left", padx=5)
-        self.toggle_bitrate_state = True
-        self.toggle_bitrate_btn = tk.Button(selection_frame, text="Toggle plus gros bitrate/groupe", command=self.toggle_highest_bitrate_per_group)
+        self.sheet.bind("<Button-3>", self._on_any_right_click)
+        self.sheet.bind("<Double-1>", self._on_native_double_click)
+        self.sheet.bind("<space>", self._on_space_toggle)
+        self.sheet.bind("<Control-i>", lambda e: self.invert_rows_selection())
+        self.sheet.bind("<Control-g>", lambda e: self.toggle_current_group())
+
+        self._apply_readonly_except_select()
+
+        # Bas
+        bottom = tk.Frame(self); bottom.pack(fill="x", pady=10)
+        sf = tk.Frame(bottom); sf.pack(side="left")
+        self.select_flac_btn = tk.Button(sf, text=translate(lang,'ui.select_all_flac'), command=self.select_all_flac_files)
+        self.select_flac_btn.pack(side="left", padx=5)
+        self.toggle_bitrate_btn = tk.Button(sf, text=translate(lang,'ui.toggle_highest_bitrate'), command=self.toggle_highest_bitrate_per_group)
         self.toggle_bitrate_btn.pack(side="left", padx=5)
-        self.filter_mode = True
-        self.filter_button = tk.Button(selection_frame, text="Filtrer (plus vieux)", command=self.toggle_filter_selection)
+        self.filter_button = tk.Button(sf, text=translate(lang,'ui.filter_oldest'), command=self.toggle_filter_selection)
         self.filter_button.pack(side="left", padx=5)
-        self.delete_button = tk.Button(bottom_frame, text="Mettre à la corbeille (0)", state="disabled", command=self.delete_duplicates)
+        self.delete_button = tk.Button(bottom, text=translate(lang,'ui.trash_btn', count=0), state="disabled", command=self.delete_duplicates)
         self.delete_button.pack(side="right", padx=10)
 
-    def _apply_readonly_except_select(self):
-        """Rend toutes les colonnes sauf la colonne de sélection en lecture seule."""
-        try:
-            headers = self.sheet.headers()
-            select_header = self.column_names["select"]
-            for idx, header in enumerate(headers):
-                if header == select_header:
-                    # colonne sélection modifiable
-                    self.sheet.column_options(idx, readonly=False)
-                else:
-                    self.sheet.column_options(idx, readonly=True)
-        except Exception:
-            pass
+    # ================== Lecteur audio ==================
+    def choose_audio_player(self):
+        import shutil
+        lang = self.language
+        players = [
+            ("VLC", shutil.which("vlc.exe")),
+            ("Windows Media Player", shutil.which("wmplayer.exe")),
+            ("Foobar2000", shutil.which("foobar2000.exe")),
+            ("AIMP", shutil.which("aimp.exe")),
+        ]
+        players = [(n, p) for n, p in players if p]
+        win = tk.Toplevel(self)
+        win.title(translate(lang,'menu.choose_player'))
+        win.geometry("420x240")
+        tk.Label(win, text=translate(lang,'menu.choose_player')).pack(pady=10)
+        var = tk.StringVar(value=self.audio_player_path or "")
+        for name, path in players:
+            tk.Radiobutton(win, text=f"{name} ({path})", variable=var, value=path).pack(anchor="w")
+        def browse():
+            exe = filedialog.askopenfilename(title=translate(lang,'menu.choose_player'), filetypes=[("Exécutables", "*.exe")])
+            if exe: var.set(exe)
+        tk.Button(win, text="...", command=browse).pack(pady=4)
+        def ok():
+            self.audio_player_path = var.get() or None
+            win.destroy()
+        tk.Button(win, text="OK", command=ok).pack(pady=6)
 
-    def redisplay_results(self, preserve_selection=True):
-        selected_paths = set()
-        if preserve_selection:
-            for row_idx, is_checked in enumerate(self.sheet.get_column_data(0)):
-                if is_checked and row_idx in self.row_to_path_map:
-                    selected_paths.add(self.row_to_path_map[row_idx])
-
-        self.sheet.set_sheet_data([[]])
-        self.row_to_path_map.clear()
-        self.row_metadata = []  # réinitialiser les métadonnées
-        self.dynamic_group_reference = {}  # reset références dynamiques sur reconstruction
-
-        if not self.all_groups:
-            self.update_delete_button()
-            return
-
-        filter_query = self.filter_var.get().lower()
-        keep_type = self.keep_type_var.get()
-        group_id = 1
-        any_duration = False
-        duration_similarity = self.duration_similarity_var.get() / 100.0 if hasattr(self, 'duration_similarity_var') else 0.95
-        data_matrix = []
-        current_row_idx = 0
-        new_states = {}
-
-        for group in self.all_groups:
-            durations = [file_info.get("duration", 0) or 0 for file_info in group]
-            min_dur = min(durations) if durations else 0
-            max_dur = max(durations) if durations else 0
-            ratio = min(min_dur, max_dur) / max(max_dur, min_dur) if max_dur > 0 and min_dur > 0 else 1.0
-            if ratio < duration_similarity:
-                continue
-
-            group.sort(key=lambda f: f.get("bitrate", 0), reverse=True)
-            group.sort(key=lambda f: f["date"])
-            file_to_keep = group[-1] if keep_type == "recent" else group[0]
-
-            for file_info in group:
-                path = file_info["path"]
-                if path in self.hidden_items:
-                    continue
-
-                if filter_query and not any(filter_query in str(file_info.get(v, "")).lower() for v in ["title", "artist", "album", "path"]):
-                    continue
-
-                self.row_to_path_map[current_row_idx] = path
-
-                display_path = os.path.relpath(path, os.path.dirname(self.folder_paths[0])) if self.folder_paths else path
-                date_str = datetime.datetime.fromtimestamp(file_info["date"]).strftime('%Y-%m-%d %H:%M:%S')
-                is_duplicate = (file_info != file_to_keep)
-                
-                check_char = is_duplicate
-                if preserve_selection and selected_paths:
-                    check_char = (path in selected_paths)
-                # Représentation texte de la case: "✔" si coché sinon vide
-                select_cell = "✔" if check_char else ""
-
-                duration_sec = file_info.get("duration", 0) or 0
-                any_duration = any_duration or (duration_sec > 0)
-                duration_str = f"{int(duration_sec // 60)}:{int(duration_sec % 60):02d}" if duration_sec > 0 else "-"
-
-                values_dict = {"select": select_cell, "title": file_info.get("title", "N/A"),
-                    "artist": file_info.get("artist", "N/A"), "album": file_info.get("album", "N/A"),
-                    "bitrate": file_info.get("bitrate", 0), "duration": duration_str, "path": display_path,
-                    "group": f"Groupe {group_id}", "date": date_str}
-                row_data = [values_dict[col] for col in self.visible_columns]
-                data_matrix.append(row_data)
-                new_states[current_row_idx] = bool(check_char)
-                # Ajouter métadonnées de ligne
-                is_reference = (file_info == file_to_keep)
-                self.row_metadata.append({
-                    "group": f"Groupe {group_id}",
-                    "is_reference": is_reference,
-                    "values": {
-                        "title": file_info.get("title", "") or "",
-                        "artist": file_info.get("artist", "") or "",
-                        "album": file_info.get("album", "") or "",
-                        "bitrate": file_info.get("bitrate", 0) or 0,
-                        "duration": duration_str  # durée formatée mm:SS pour cohérence d'affichage
-                    }
-                })
-                current_row_idx += 1
-
-            group_id += 1
-
-        self.sheet.set_sheet_data(data_matrix, reset_col_positions=True, reset_row_positions=True)
-        self._apply_readonly_except_select()
-        # Initialiser états internes depuis new_states
-        self.checkbox_states = new_states
-        if not any_duration and "duration" in self.visible_columns:
-            self.status_label.config(text="Aucune durée trouvée : le scan ne fournit pas la durée des fichiers.")
-        self.update_delete_button()
-        # Appliquer la coloration des différences après la mise à jour du bouton
-        self._apply_difference_highlighting()
-
-    def get_selected_files(self):
-        selected_paths = []
-        for row_idx, checked in self.checkbox_states.items():
-            if checked and row_idx in self.row_to_path_map:
-                selected_paths.append(self.row_to_path_map[row_idx])
-        return selected_paths
-
-    def update_delete_button(self):
-        count = sum(1 for v in self.checkbox_states.values() if v)
-        state = tk.NORMAL if count > 0 else tk.DISABLED
-        self.delete_button.config(state=state, text=f"Mettre à la corbeille ({count})")
-        if self.debug_mode:
-            sample = ", ".join(f"{i}:{int(self.checkbox_states[i])}" for i in list(self.checkbox_states.keys())[:10])
-            self.status_label.config(text=f"Debug états internes: {sample} | count={count}")
-
-    def delete_duplicates(self):
-        files_to_delete = self.get_selected_files()
-        if not files_to_delete:
-            messagebox.showwarning("Aucune sélection", "Aucun fichier n'est coché pour la suppression.")
-            return
-
-        # Pré‑validation des chemins (détection chemins relatifs / inexistants)
-        precheck_rows = []
-        reconstructed = []
-        base_dirs = self.folder_paths[:]  # dossiers racines
-        validated_files = []
-        for f_path in files_to_delete:
-            original = f_path
-            abs_path = os.path.abspath(f_path)
-            exists = os.path.exists(abs_path)
-            # Si le chemin ne pointe à rien mais ressemble à un relatif, tenter reconstruction
-            if not exists and not os.path.isabs(f_path):
-                for base in base_dirs:
-                    candidate = os.path.abspath(os.path.join(base, f_path))
-                    if os.path.exists(candidate):
-                        abs_path = candidate
-                        exists = True
-                        reconstructed.append((original, candidate))
-                        break
-            # Dernier recours: si perdu et qu'il y a un mapping row -> path on le garde tel quel
-            validated_files.append((original, abs_path, exists))
-        if any(not e for (_, _, e) in validated_files):
-            missing_list = "\n".join(f"- {orig} (après tentative: {abs_p})" for (orig, abs_p, e) in validated_files if not e)
-            if not messagebox.askyesno(
-                "Fichiers introuvables",
-                "Certains fichiers semblent introuvables et ne seront pas supprimés:\n" + missing_list + "\n\nContinuer quand même pour les autres ?"
-            ):
-                return
-        if reconstructed and self.debug_mode:
-            recon_msg = "\n".join(f"{o} -> {r}" for o, r in reconstructed)
-            self.status_label.config(text=f"Reconstruit: {len(reconstructed)} chemins")
-
-        # Ne conserver que ceux qui existent réellement
-        existing_files = [abs_p for (orig, abs_p, e) in validated_files if e]
-        if not existing_files:
-            messagebox.showerror("Suppression", "Aucun des fichiers sélectionnés n'a été trouvé sur le disque.")
-            return
-
-        msg_lines = [f"{len(existing_files)} fichier(s) seront envoyés à la corbeille."]
-        if reconstructed:
-            msg_lines.append(f"{len(reconstructed)} chemin(s) ont été reconstruits depuis un chemin relatif.")
-        if len(existing_files) <= 10:
-            msg_lines.append("Liste :")
-            msg_lines.extend(existing_files)
-        msg = "\n".join(msg_lines) + "\n\nContinuer ?"
-        if not messagebox.askyesno("Confirmation", msg):
-            return
-
-        deleted_count, error_count = 0, 0
-        errors = []
-        for abs_path in existing_files:
-            try:
-                send2trash(abs_path)
-                deleted_count += 1
-            except Exception as e:
-                errors.append(f"- {abs_path}: {e}")
-                error_count += 1
-
-        # Mise à jour des groupes : fi['path'] peut être absolu, on compare sur normalisation
-        deleted_set_norm = {os.path.normcase(os.path.abspath(p)) for p in existing_files}
-        new_groups = []
-        for g in self.all_groups:
-            new_g = []
-            for fi in g:
-                try:
-                    p_norm = os.path.normcase(os.path.abspath(fi["path"]))
-                except Exception:
-                    p_norm = fi.get("path")
-                if p_norm not in deleted_set_norm:
-                    new_g.append(fi)
-            if len(new_g) > 1:  # garder uniquement les groupes qui restent des doublons
-                new_groups.append(new_g)
-        self.all_groups = new_groups
-
-        info_message = f"{deleted_count} fichier(s) déplacé(s) vers la corbeille."
-        if error_count > 0:
-            info_message += f"\n{error_count} erreur(s) lors du déplacement:\n" + "\n".join(errors)
-        if reconstructed:
-            info_message += f"\n{len(reconstructed)} chemin(s) reconstruits (voir console / debug)."
-        messagebox.showinfo("Opération Terminée", info_message)
-        self.redisplay_results(preserve_selection=False)
-
-    def _set_dynamic_reference_from_row(self, row):
-        """Définit la ligne de référence dynamique pour son groupe (si colonne groupe visible)."""
-        if row is None:
-            return
-        if "group" not in self.visible_columns:
-            return
-        try:
-            g_idx = self.visible_columns.index("group")
-            g_val = self.sheet.get_cell_data(row, g_idx)
-            if g_val:
-                self.dynamic_group_reference[g_val] = row
-                # Re-appliquer uniquement le groupe concerné (on recolorise tout pour simplicité)
-                self._apply_difference_highlighting()
-        except Exception:
-            pass
-
+    # ================== Événements cellule / clavier ==================
     def _on_cell_clicked(self, event):
-        row, col = event["row"], event["column"]
-        sel_idx = self._select_column_index()
-        if col == sel_idx:
-            # Simple clic dans colonne Supprimer?: on sélectionne juste la ligne visuellement, pas de toggle.
-            try:
-                if hasattr(self.sheet, 'set_currently_selected'):
-                    self.sheet.set_currently_selected((row, col))
-                if hasattr(self.sheet, 'select_row'):
-                    self.sheet.select_row(row)
-                elif hasattr(self.sheet, 'add_selection'):
-                    self.sheet.add_selection("row", row, redraw=True)
-            except Exception:
-                pass
-            # Mise à jour référence dynamique malgré retour break
+        row, col = event.get("row"), event.get("column")
+        if row is None or col is None:
+            return
+        sel_col = self._select_column_index()
+        # Clic dans colonne de sélection: juste focus
+        if col == sel_col:
             self._set_dynamic_reference_from_row(row)
             return "break"
-        # Autres colonnes : ouverture du fichier (simple clic)
+        # Définir référence différence
         self._set_dynamic_reference_from_row(row)
-        self.after(10, self.update_delete_button)
+        # Ouvrir le fichier (comportement d’origine)
         try:
             if row in self.row_to_path_map:
-                file_path = self.row_to_path_map[row]
-                os.startfile(os.path.normpath(file_path))
+                os.startfile(os.path.normpath(self.row_to_path_map[row]))
         except Exception as e:
-            messagebox.showerror("Erreur de Lecture", f"Impossible d'ouvrir le fichier :\n{e}")
+            messagebox.showerror("Erreur", f"{translate(self.language,'msg.open_error')} {e}")
 
-    def _on_native_double_click(self, event):
-        """Gestion du double-clic (fallback natif Tk) pour cocher/décocher ou ouvrir le fichier.
-        Utilise la cellule actuellement sélectionnée par le simple clic précédent."""
+    def _on_native_double_click(self, _event):
         try:
-            current = self.sheet.get_currently_selected()
+            cur = self.sheet.get_currently_selected()
         except Exception:
-            current = None
-        if not (isinstance(current, tuple) and len(current) >= 2):
+            cur = None
+        if not (isinstance(cur, tuple) and len(cur) >= 2):
             return
-        row, col = current[0], current[1]
         try:
-            row = int(row); col = int(col)
+            row, col = int(cur[0]), int(cur[1])
         except Exception:
             return
-        sel_idx = self._select_column_index()
-        # Toujours mettre à jour la référence dynamique (quel que soit la colonne) pour retour visuel immédiat
         self._set_dynamic_reference_from_row(row)
-        if col == sel_idx:
-            # Toggle case
+        if col == self._select_column_index():
             self._toggle_checkbox(row)
             return "break"
-        # Double clic ailleurs : ouvrir le fichier
         if row in self.row_to_path_map:
             try:
-                file_path = self.row_to_path_map[row]
-                os.startfile(os.path.normpath(file_path))
+                os.startfile(os.path.normpath(self.row_to_path_map[row]))
             except Exception as e:
-                messagebox.showerror("Erreur de Lecture", f"Impossible d'ouvrir le fichier :\n{e}")
+                messagebox.showerror("Erreur", f"{translate(self.language,'msg.open_error')} {e}")
         return "break"
 
-    def _on_cell_right_click(self, event):
-        """Menu contextuel sur clic droit dans une cellule.
-        Accepte soit un dict (événement tksheet), soit un événement Tk classique.
-        """
-        row = None
-        col = None
-        x_root = None
-        y_root = None
-        # Cas dict (tksheet extra_bindings)
-        if isinstance(event, dict):
-            row = event.get("row")
-            col = event.get("column")
-            x_root = event.get("x_root")
-            y_root = event.get("y_root")
-        else:
-            # Événement Tk classique
-            try:
-                x_root = event.x_root
-                y_root = event.y_root
-            except Exception:
-                try:
-                    x_root = self.winfo_pointerx()
-                    y_root = self.winfo_pointery()
-                except Exception:
-                    pass
-            # Essayer de récupérer la cellule actuellement sélectionnée
-            try:
-                current = self.sheet.get_currently_selected()
-                if isinstance(current, tuple) and len(current) >= 2:
-                    row, col = current[0], current[1]
-            except Exception:
-                pass
-            # Sinon essayer les lignes sélectionnées
-            if row is None:
-                try:
-                    sel_rows = self.sheet.get_selected_rows()
-                    if sel_rows:
-                        row = list(sel_rows)[0]
-                except Exception:
-                    pass
-        # Construction du menu (version épurée)
-        menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label="Cocher la ligne", command=lambda: self._set_row_checkbox(row, True))
-        menu.add_command(label="Décocher la ligne", command=lambda: self._set_row_checkbox(row, False))
-        # Ajouter systématiquement l'option inversion (même sans sélection multiple)
-        menu.add_separator()
-        menu.add_command(label="Inverser la sélection (Ctrl+I)", command=self.invert_rows_selection)
-        # Actions de groupe si colonne groupe visible
-        if "group" in self.visible_columns and row is not None:
-            try:
-                group_val = self.sheet.get_cell_data(row, self.visible_columns.index("group"))
-                menu.add_separator()
-                menu.add_command(label="Cocher tout le groupe", command=lambda gv=group_val: self._set_group_checkbox(gv, True))
-                menu.add_command(label="Décocher tout le groupe", command=lambda gv=group_val: self._set_group_checkbox(gv, False))
-                menu.add_command(label="Basculer tout le groupe (Ctrl+G)", command=self.toggle_current_group)
-            except Exception:
-                pass
-        menu.add_separator()
-        menu.add_command(label="Mettre à jour le bouton", command=self.update_delete_button)
-        menu.add_checkbutton(label="Mode debug (afficher valeurs)", onvalue=True, offvalue=False,
-                             variable=tk.BooleanVar(value=self.debug_mode),
-                             command=lambda: self._toggle_debug())
-        menu.add_command(label="Voir valeurs brutes col sélection", command=self._debug_show_selection_values)
-        try:
-            if x_root is None or y_root is None:
-                x_root = self.winfo_pointerx()
-                y_root = self.winfo_pointery()
-            menu.tk_popup(x_root, y_root)
-        finally:
-            try:
-                menu.grab_release()
-            except Exception:
-                pass
-        # Empêcher éventuel menu par défaut
-        return "break"
-
-    def _on_header_right_click(self, event):
-        menu = tk.Menu(self, tearoff=0)
-        for col in self.all_columns:
-            if col == "select": continue
-            checked = tk.BooleanVar(value=col in self.visible_columns)
-            def toggle_col(c=col, var=checked):
-                if var.get():
-                    if c not in self.visible_columns: self.visible_columns.append(c)
-                else:
-                    if c in self.visible_columns: self.visible_columns.remove(c)
-                if len(self.visible_columns) < 2: self.visible_columns.append(c)
-                if 'select' not in self.visible_columns: self.visible_columns.insert(0, 'select')
-                self.sheet.headers([self.column_names[c] for c in self.visible_columns])
-                self.redisplay_results()
-            menu.add_checkbutton(label=self.column_names[col], variable=checked, command=toggle_col)
-        menu.tk_popup(event["x_root"], event["y_root"])
-
-    def _set_checkbox(self, row, value):
-        self.checkbox_states[row] = bool(value)
-        try:
-            sel_idx = self._select_column_index()
-            self.sheet.set_cell_data(row, sel_idx, "✔" if value else "")
-        except Exception:
-            pass
-
-    def _toggle_checkbox(self, row):
-        current = self.checkbox_states.get(row, False)
-        self._set_checkbox(row, not current)
-        self.update_delete_button()
-
-    def _set_row_checkbox(self, row, value):
-        if row is None:
-            return
-        self._set_checkbox(row, value)
-        self.update_delete_button()
-
-    def _set_group_checkbox(self, group_val, value):
-        group_idx = self.visible_columns.index("group") if "group" in self.visible_columns else None
-        if group_idx is None:
-            return
-        sel_idx = self._select_column_index()
-        for r, row_data in enumerate(self.sheet.get_sheet_data()):
-            if row_data and row_data[group_idx] == group_val:
-                self._set_checkbox(r, value)
-        self.update_delete_button()
-
-    def select_rows_selection(self):
-        for r in self.sheet.get_selected_rows():
-            self._set_checkbox(r, True)
-        self.update_delete_button()
-
-    def deselect_rows_selection(self):
-        for r in self.sheet.get_selected_rows():
-            self._set_checkbox(r, False)
-        self.update_delete_button()
-
-    def invert_rows_selection(self):
-        """Inverse l'état des cases des lignes sélectionnées; si aucune sélection explicite, utilise la ligne courante."""
+    def _on_space_toggle(self, _event):
         try:
             selected = list(self.sheet.get_selected_rows())
         except Exception:
             selected = []
         if not selected:
-            # Utiliser la ligne courante si aucune sélection multiple
             try:
-                current = self.sheet.get_currently_selected()
-                if isinstance(current, tuple) and len(current) >= 1:
-                    selected = [int(current[0])]
+                cur = self.sheet.get_currently_selected()
+                if cur:
+                    selected = [int(cur[0])]
             except Exception:
-                selected = []
-        if not selected:
-            return
+                pass
         for r in selected:
             self._set_checkbox(r, not self.checkbox_states.get(r, False))
         self.update_delete_button()
-
-    def select_group(self):
-        selected = self.sheet.get_selected_rows()
-        if not selected:
-            return
-        row = selected.pop()
-        group_val = self.sheet.get_cell_data(row, self.visible_columns.index("group"))
-        for r, row_data in enumerate(self.sheet.get_sheet_data()):
-            if row_data and row_data[self.visible_columns.index("group")] == group_val:
-                self._set_checkbox(r, True)
-        self.update_delete_button()
-
-    def deselect_group(self):
-        selected = self.sheet.get_selected_rows()
-        if not selected:
-            return
-        row = selected.pop()
-        group_val = self.sheet.get_cell_data(row, self.visible_columns.index("group"))
-        for r, row_data in enumerate(self.sheet.get_sheet_data()):
-            if row_data and row_data[self.visible_columns.index("group")] == group_val:
-                self._set_checkbox(r, False)
-        self.update_delete_button()
-
-    def select_all_flac_files(self):
-        path_idx = self.visible_columns.index("path")
-        for r, row_data in enumerate(self.sheet.get_sheet_data()):
-            if row_data and str(row_data[path_idx]).lower().endswith('.flac'):
-                self._set_checkbox(r, self.toggle_flac_state)
-        self.toggle_flac_state = not self.toggle_flac_state
-        self.update_delete_button()
-
-    def toggle_highest_bitrate_per_group(self):
-        group_idx = self.visible_columns.index("group")
-        bitrate_idx = self.visible_columns.index("bitrate")
-        date_idx = self.visible_columns.index("date")
-        data = self.sheet.get_sheet_data()
-        group_map = {}
-        for r, row_data in enumerate(data):
-            if not row_data:
-                continue
-            group = row_data[group_idx]
-            group_map.setdefault(group, []).append((r, row_data))
-        for group_items in group_map.values():
-            max_bitrate = -1
-            max_rows = []
-            for r, row_data in group_items:
-                bitrate = int(row_data[bitrate_idx]) if str(row_data[bitrate_idx]).isdigit() else 0
-                if bitrate > max_bitrate:
-                    max_bitrate = bitrate
-                    max_rows = [(r, row_data)]
-                elif bitrate == max_bitrate:
-                    max_rows.append((r, row_data))
-            min_date, min_row = float('inf'), None
-            for r, row_data in max_rows:
-                date = datetime.datetime.strptime(row_data[date_idx], '%Y-%m-%d %H:%M:%S').timestamp()
-                if date < min_date:
-                    min_date, min_row = date, r
-            for r, _ in group_items:
-                self._set_checkbox(r, (r != min_row) if self.toggle_bitrate_state else (r == min_row))
-        self.toggle_bitrate_state = not self.toggle_bitrate_state
-        self.update_delete_button()
-
-    def start_scan_thread(self):
-        if self.scan_in_progress:
-            return
-        if not self.folder_paths:
-            messagebox.showerror("Erreur", "Veuillez ajouter au moins un dossier à analyser.")
-            return
-        self.scan_in_progress = True
-        self.scan_button.config(state="disabled")
-        self.add_folder_button.config(state="disabled")
-        # Boutons multiples dossiers si présent
-        if hasattr(self, 'add_multiple_folders_button'):
-            self.add_multiple_folders_button.config(state="disabled")
-        self.remove_folder_button.config(state="disabled")
-        self.clear_results_data()
-        thread = threading.Thread(
-            target=scan_duplicates,
-            args=(self.folder_paths.copy(), self.keep_type_var.get(), self.queue, self.similarity_var.get() / 100.0),
-            daemon=True
-        )
-        thread.start()
-
-    def process_queue(self):
-        try:
-            while True:
-                msg_type, data = self.queue.get_nowait()
-                if msg_type == "status":
-                    self.status_label.config(text=data)
-                elif msg_type == "progress":
-                    self.progress_bar["value"] = data
-                elif msg_type == "progress_max":
-                    self.progress_bar["maximum"] = data
-                elif msg_type == "message":
-                    level, text = data
-                    if level == "info":
-                        messagebox.showinfo("Information", text)
-                    else:
-                        messagebox.showerror("Erreur", text)
-                elif msg_type == "results":
-                    self.all_groups = data
-                    self.redisplay_results(preserve_selection=False)
-                elif msg_type == "finished":
-                    self.scan_in_progress = False
-                    self.scan_button.config(state="normal")
-                    self.add_folder_button.config(state="normal")
-                    if hasattr(self, 'add_multiple_folders_button'):
-                        self.add_multiple_folders_button.config(state="normal")
-                    self.remove_folder_button.config(state="normal")
-                    self.status_label.config(text="Analyse terminée.")
-                    self.progress_bar["value"] = 0
-        except queue.Empty:
-            self.after(100, self.process_queue)
-
-    def clear_results_data(self):
-        self.all_groups = []
-        self.hidden_items = set()
-        self.checkbox_states = {}
-        self.row_metadata = []
-        self.dynamic_group_reference = {}
-        try:
-            self.sheet.set_sheet_data([[]])
-        except Exception:
-            pass
-        self.update_delete_button()
-        self.status_label.config(text="Prêt.")
-
-    def toggle_filter_selection(self):
-        mode = self.filter_mode
-        self.filter_mode = not self.filter_mode
-        self.filter_button.config(text="Filtrer (plus récent)" if not mode else "Filtrer (plus vieux)")
-        if "group" not in self.visible_columns or "date" not in self.visible_columns:
-            return
-        group_idx = self.visible_columns.index("group")
-        date_idx = self.visible_columns.index("date")
-        data = self.sheet.get_sheet_data()
-        group_map = {}
-        for r, row_data in enumerate(data):
-            if not row_data:
-                continue
-            group = row_data[group_idx]
-            group_map.setdefault(group, []).append((r, row_data))
-        for group_items in group_map.values():
-            best_row, best_date = None, None
-            for r, row_data in group_items:
-                try:
-                    date = datetime.datetime.strptime(row_data[date_idx], '%Y-%m-%d %H:%M:%S').timestamp()
-                except Exception:
-                    date = 0
-                if best_date is None or (mode and date < best_date) or (not mode and date > best_date):
-                    best_date, best_row = date, r
-            for r, _ in group_items:
-                self._set_checkbox(r, r != best_row)
-        self.update_delete_button()
-
-    # --- Réintroduction des méthodes supprimées par inadvertance ---
-    def add_folder(self):
-        path = filedialog.askdirectory()
-        if path and path not in self.folder_paths:
-            self.folder_paths.append(path)
-            self.folder_listbox.insert(tk.END, path)
-            self.clear_results_data()
-
-    def add_multiple_folders(self):
-        dialog = AskMultipleFoldersDialog(self)
-        new_paths = dialog.paths
-        if new_paths:
-            for path in new_paths:
-                if path not in self.folder_paths:
-                    self.folder_paths.append(path)
-                    self.folder_listbox.insert(tk.END, path)
-            self.clear_results_data()
-
-    def remove_folder(self):
-        selected_indices = self.folder_listbox.curselection()
-        if not selected_indices:
-            return
-        for i in sorted(selected_indices, reverse=True):
-            del self.folder_paths[i]
-            self.folder_listbox.delete(i)
-        self.clear_results_data()
-
-    # --- SUPPRESSION des doublons: les méthodes suivantes étaient redéfinies plus bas ---
-    # Les définitions en double de start_scan_thread, process_queue, clear_results_data,
-    # toggle_filter_selection, add_folder, add_multiple_folders, remove_folder ont été supprimées
-    # pour éviter toute confusion. Les versions actives restent plus haut dans le fichier.
-
-    # Fin des suppressions de doublons.
-
-    # === Ajout méthodes debug manquantes ===
-    def _toggle_debug(self):
-        self.debug_mode = not self.debug_mode
-        state = "ON" if self.debug_mode else "OFF"
-        self.status_label.config(text=f"Mode debug {state}")
-        self.update_delete_button()
-
-    def _debug_show_selection_values(self):
-        try:
-            sel_idx = self._select_column_index()
-            rows = len(self.sheet.get_sheet_data())
-            raw = []
-            for r in range(min(rows, 50)):
-                try:
-                    cell_val = self.sheet.get_cell_data(r, sel_idx)
-                except Exception:
-                    cell_val = None
-                internal = self.checkbox_states.get(r, False)
-                raw.append(f"{r}: cell={cell_val!r} internal={int(bool(internal))}")
-            if not raw:
-                raw.append("(aucune ligne)")
-            messagebox.showinfo("Debug sélection", "\n".join(raw))
-        except Exception as e:
-            messagebox.showerror("Debug erreur", str(e))
-
-    def _on_space_toggle(self, event):
-        """Toggle via barre espace: toutes les lignes sélectionnées si selection, sinon la ligne courante."""
-        try:
-            selected_rows = list(self.sheet.get_selected_rows())
-        except Exception:
-            selected_rows = []
-        if not selected_rows:
-            # ligne courante
-            try:
-                current = self.sheet.get_currently_selected()
-                if isinstance(current, tuple) and len(current) >= 1:
-                    row = int(current[0])
-                    selected_rows = [row]
-            except Exception:
-                pass
-        toggled_any = False
-        for r in selected_rows:
-            old = self.checkbox_states.get(r, False)
-            self._set_checkbox(r, not old)
-            toggled_any = True
-        if toggled_any:
-            self.update_delete_button()
         return "break"
 
-    def toggle_current_group(self):
-        """Bascule (cocher/décocher) l'ensemble du groupe de la ligne courante ou de la première ligne sélectionnée.
-        Si au moins un élément du groupe n'est pas coché -> tout cocher, sinon tout décocher."""
-        if "group" not in self.visible_columns:
-            return
-        group_idx = self.visible_columns.index("group")
-        # Récupérer la ligne courante prioritairement
-        row = None
+    def _on_any_right_click(self, event):
+        """Routeur générique pour détecter si le clic droit est sur l’entête ou une cellule."""
         try:
-            current = self.sheet.get_currently_selected()
-            if isinstance(current, tuple) and len(current) >= 1:
-                row = int(current[0])
+            header_h = getattr(self.sheet, 'header_height', None)
+            if header_h is None:
+                header_h = getattr(self.sheet.MT, 'header_height', 25)
+            if event.y <= header_h:
+                col = None
+                try:
+                    if hasattr(self.sheet, 'identify_col'):
+                        col = self.sheet.identify_col(event.x)
+                except Exception:
+                    col = None
+                synth = {"column": col, "x_root": event.x_root, "y_root": event.y_root}
+                return self._on_header_right_click(synth)
         except Exception:
             pass
-        if row is None:
-            try:
-                sel = self.sheet.get_selected_rows()
-                if sel:
-                    row = list(sel)[0]
-            except Exception:
-                pass
-        if row is None:
-            return
-        try:
-            group_val = self.sheet.get_cell_data(row, group_idx)
-        except Exception:
-            return
-        # Collecter les lignes du groupe
-        group_rows = []
-        for r, row_data in enumerate(self.sheet.get_sheet_data()):
-            if row_data and row_data[group_idx] == group_val:
-                group_rows.append(r)
-        if not group_rows:
-            return
-        any_unchecked = any(not self.checkbox_states.get(r, False) for r in group_rows)
-        new_state = True if any_unchecked else False
-        for r in group_rows:
-            self._set_checkbox(r, new_state)
-        self.update_delete_button()
+        return self._on_cell_right_click(event)
 
-    def toggle_highlight_differences(self):
-        """Active/Désactive la mise en évidence des différences intra-groupe.
-        Quand on désactive, on tente de restaurer la couleur par défaut (noir) sur les colonnes comparables.
-        """
-        self.highlight_differences = not self.highlight_differences
-        if not self.highlight_differences:
-            self._clear_difference_highlighting()
+    # ================== Événements table (menus traduits) ==================
+    def _on_cell_right_click(self, event):
+        lang = self.language
+        if isinstance(event, dict): row = event.get("row")
         else:
-            self._apply_difference_highlighting()
-
-    def _clear_difference_highlighting(self):
-        """Remet les couleurs par défaut (texte noir) sur les colonnes susceptibles d'avoir été colorées."""
-        try:
-            comparable_keys = ["title", "artist", "album", "bitrate", "duration"]
-            # Limiter aux colonnes visibles
-            target_indices = [self.visible_columns.index(k) for k in comparable_keys if k in self.visible_columns]
-            data = self.sheet.get_sheet_data()
-            for r in range(len(data)):
-                for c in target_indices:
-                    try:
-                        if hasattr(self.sheet, 'highlight_cells'):
-                            self.sheet.highlight_cells(row=r, column=c, fg='black', redraw=False)
-                    except Exception:
-                        pass
             try:
-                self.sheet.redraw()
+                cur = self.sheet.get_currently_selected(); row = cur[0] if cur else None
+            except Exception:
+                row = None
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label=translate(lang,'ctx.check_row'), command=lambda: self._set_row_checkbox(row, True))
+        menu.add_command(label=translate(lang,'ctx.uncheck_row'), command=lambda: self._set_row_checkbox(row, False))
+        menu.add_separator()
+        menu.add_command(label=translate(lang,'ctx.invert_selection'), command=self.invert_rows_selection)
+        if "group" in self.visible_columns and row is not None:
+            try:
+                g_val = self.sheet.get_cell_data(row, self.visible_columns.index("group"))
+                menu.add_separator()
+                menu.add_command(label=translate(lang,'ctx.check_group'), command=lambda gv=g_val: self._set_group_checkbox(gv, True))
+                menu.add_command(label=translate(lang,'ctx.uncheck_group'), command=lambda gv=g_val: self._set_group_checkbox(gv, False))
+                menu.add_command(label=translate(lang,'ctx.toggle_group'), command=self.toggle_current_group)
             except Exception:
                 pass
-        except Exception:
-            pass
-
-    def _apply_difference_highlighting(self):
-        """Coloration fine : seules les cellules qui diffèrent de la ligne de référence (fichier conservé) sont rouges.
-        Référence = ligne marquée is_reference dans self.row_metadata pour chaque groupe.
-        Colonnes analysées: title, artist, album, bitrate, duration (si visibles).
-        """
-        if not self.highlight_differences:
-            return
-        if not self.row_metadata or not self.visible_columns:
-            return
+        menu.add_separator()
+        menu.add_checkbutton(label=translate(lang,'ctx.debug_mode'), onvalue=True, offvalue=False,
+                             variable=tk.BooleanVar(value=self.debug_mode), command=self._toggle_debug)
+        menu.add_command(label=translate(lang,'ctx.show_debug_select'), command=self._debug_show_selection_values)
         try:
-            comparable_keys = ["title", "artist", "album", "bitrate", "duration"]
-            key_to_col = {k: self.visible_columns.index(k) for k in comparable_keys if k in self.visible_columns}
-            if "group" not in self.visible_columns:
-                return
-            # Nettoyage préalable
-            if hasattr(self.sheet, 'highlight_cells'):
-                for r in range(len(self.sheet.get_sheet_data())):
-                    for col_idx in key_to_col.values():
-                        try:
-                            self.sheet.highlight_cells(row=r, column=col_idx, fg='black', redraw=False)
-                        except Exception:
-                            pass
-            # Regrouper
-            groups = {}
-            for r, meta in enumerate(self.row_metadata):
-                g = meta.get("group")
-                groups.setdefault(g, {"rows": [], "ref_row": None})
-                groups[g]["rows"].append(r)
-                if meta.get("is_reference"):
-                    groups[g]["ref_row"] = r
-            # Appliquer
-            for g, info in groups.items():
-                rows = info['rows']
-                if not rows:
-                    continue
-                # Choisir: référence dynamique prioritaire si still present
-                dyn_ref = self.dynamic_group_reference.get(g)
-                if dyn_ref is not None and dyn_ref in rows:
-                    ref_row = dyn_ref
+            x_root = event.get('x_root') if isinstance(event, dict) else event.x_root
+            y_root = event.get('y_root') if isinstance(event, dict) else event.y_root
+        except Exception:
+            x_root = self.winfo_pointerx(); y_root = self.winfo_pointery()
+        try:
+            menu.tk_popup(x_root, y_root)
+        finally:
+            try: menu.grab_release()
+            except Exception: pass
+        return "break"
+
+    def _on_header_right_click(self, event):
+        lang = self.language
+        menu = tk.Menu(self, tearoff=0)
+        clicked_col_index = None
+        try:
+            if isinstance(event, dict) and 'column' in event:
+                clicked_col_index = event['column']
+            elif hasattr(event, 'column'):
+                clicked_col_index = event.column
+        except Exception:
+            clicked_col_index = None
+        clicked_key = None
+        if isinstance(clicked_col_index, int) and 0 <= clicked_col_index < len(self.visible_columns):
+            clicked_key = self.visible_columns[clicked_col_index]
+        # Reset
+        menu.add_command(label=translate(lang,'ctx.reset_columns'), command=self.reset_columns)
+        menu.add_separator()
+        # Cacher
+        if clicked_key and clicked_key != 'select':
+            def hide():
+                if clicked_key in self.visible_columns:
+                    if len(self.visible_columns) <= 2:
+                        messagebox.showwarning(translate(lang,'msg.action_denied'), translate(lang,'msg.cannot_hide_more'))
+                        return
+                    self.visible_columns.remove(clicked_key)
+                    self._apply_visible_columns()
+            menu.add_command(label=translate(lang,'ctx.hide_col', name=self.column_names.get(clicked_key, clicked_key)), command=hide)
+            menu.add_separator()
+        # Déplacer
+        if clicked_key:
+            idx = self.visible_columns.index(clicked_key)
+            if idx > 0 and clicked_key != 'select':
+                def left():
+                    i = self.visible_columns.index(clicked_key)
+                    if i > 0:
+                        self.visible_columns[i], self.visible_columns[i-1] = self.visible_columns[i-1], self.visible_columns[i]
+                        if 'select' in self.visible_columns:
+                            self.visible_columns = ['select'] + [c for c in self.visible_columns if c != 'select']
+                        self._apply_visible_columns()
+                menu.add_command(label=translate(lang,'ctx.move_left'), command=left)
+            if idx < len(self.visible_columns) - 1:
+                def right():
+                    i = self.visible_columns.index(clicked_key)
+                    if i < len(self.visible_columns)-1:
+                        self.visible_columns[i], self.visible_columns[i+1] = self.visible_columns[i+1], self.visible_columns[i]
+                        if 'select' in self.visible_columns:
+                            self.visible_columns = ['select'] + [c for c in self.visible_columns if c != 'select']
+                        self._apply_visible_columns()
+                menu.add_command(label=translate(lang,'ctx.move_right'), command=right)
+            menu.add_separator()
+        # Colonnes cachées
+        hidden = [c for c in self.all_columns if c not in self.visible_columns]
+        if hidden:
+            show_sub = tk.Menu(menu, tearoff=0)
+            for key in hidden:
+                def make_show(k=key):
+                    if k not in self.visible_columns:
+                        self.visible_columns.append(k)
+                        if k == 'select':
+                            self.visible_columns = ['select'] + [c for c in self.visible_columns if c != 'select']
+                        self._apply_visible_columns()
+                show_sub.add_command(label=self.column_names.get(key, key), command=make_show)
+            menu.add_cascade(label=translate(lang,'ctx.show_hidden_col'), menu=show_sub)
+        else:
+            menu.add_command(label=translate(lang,'ctx.no_hidden_col'), state='disabled')
+        def show_all():
+            self.visible_columns = list(self.all_columns)
+            if 'select' in self.visible_columns:
+                self.visible_columns.remove('select'); self.visible_columns.insert(0, 'select')
+            self._apply_visible_columns()
+        menu.add_command(label=translate(lang,'ctx.show_all'), command=show_all)
+        menu.add_separator()
+        toggle_sub = tk.Menu(menu, tearoff=0)
+        for col in self.all_columns:
+            if col == 'select':
+                continue
+            var = tk.BooleanVar(value=col in self.visible_columns)
+            def toggle(c=col, v=var):
+                if v.get():
+                    if c not in self.visible_columns: self.visible_columns.append(c)
                 else:
-                    ref_row = info.get('ref_row') if info.get('ref_row') is not None else rows[0]
-                ref_vals = self.row_metadata[ref_row].get('values', {})
-                for r in rows:
-                    if r == ref_row:
-                        continue
-                    row_vals = self.row_metadata[r].get('values', {})
-                    for key, col_idx in key_to_col.items():
-                        rv = row_vals.get(key, ""); rf = ref_vals.get(key, "")
-                        if key == 'bitrate':
-                            try: rvn = int(rv)
-                            except Exception: rvn = -1
-                            try: rfn = int(rf)
-                            except Exception: rfn = -1
-                            diff = (rvn != rfn)
-                        else:
-                            lv = rv.strip().lower() if isinstance(rv, str) else rv
-                            lf = rf.strip().lower() if isinstance(rf, str) else rf
-                            diff = (lv != lf)
-                        if diff:
-                            try:
-                                if hasattr(self.sheet, 'highlight_cells'):
-                                    self.sheet.highlight_cells(row=r, column=col_idx, fg='red', redraw=False)
-                            except Exception:
-                                pass
-            try:
-                self.sheet.redraw()
-            except Exception:
-                pass
+                    if c in self.visible_columns and len(self.visible_columns) > 2:
+                        self.visible_columns.remove(c)
+                    elif c in self.visible_columns and len(self.visible_columns) <= 2:
+                        v.set(True)
+                self._apply_visible_columns()
+            toggle_sub.add_checkbutton(label=self.column_names[col], variable=var, command=toggle)
+        menu.add_cascade(label=translate(lang,'ctx.visible_columns'), menu=toggle_sub)
+        try:
+            x_root = event.get('x_root') if isinstance(event, dict) else event.x_root
+            y_root = event.get('y_root') if isinstance(event, dict) else event.y_root
         except Exception:
-            # En cas d'échec silencieux (compatibilité versions tksheet)
+            x_root = self.winfo_pointerx(); y_root = self.winfo_pointery()
+        try:
+            menu.tk_popup(x_root, y_root)
+        finally:
+            try: menu.grab_release()
+            except Exception: pass
+        return "break"
+
+    # ================== Divers ==================
+    def _toggle_debug(self):  # override mixin to re-utiliser status_label
+        self.debug_mode = not self.debug_mode
+        try:
+            self.status_label.config(text=f"Mode debug {'ON' if self.debug_mode else 'OFF'}")
+        except Exception:
             pass
+
+if __name__ == "__main__":
+    app = DuplicateMusicFinder()
+    app.mainloop()
