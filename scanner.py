@@ -172,6 +172,7 @@ def scan_duplicates(paths_to_scan, date_type, queue, title_similarity_threshold=
                 file_hash = file_sha1(full_path)
                 # Vérifier si l'empreinte est déjà stockée dans les tags
                 fp_from_tag = get_fingerprint_from_tags(full_path)
+                duration = None
                 if fp_from_tag:
                     fp = fp_from_tag
                     duration = None  # On ne stocke pas la durée dans le tag, donc on la laisse à None
@@ -181,8 +182,17 @@ def scan_duplicates(paths_to_scan, date_type, queue, title_similarity_threshold=
                     duration, fp = acoustid.fingerprint_file(full_path)
                     if file_hash:
                         fp_cache[file_hash] = (duration, fp)
-                    # Enregistrer l'empreinte dans le tag du fichier
                     set_fingerprint_in_tags(full_path, fp)
+                # Toujours essayer de lire la durée si elle est absente
+                if duration is None:
+                    try:
+                        audio = File(full_path)
+                        if audio and hasattr(audio, 'info') and hasattr(audio.info, 'length'):
+                            duration = float(audio.info.length)
+                        else:
+                            duration = 0
+                    except Exception:
+                        duration = 0
                 stat = os.stat(full_path)
                 try:
                     audio = File(full_path, easy=True)

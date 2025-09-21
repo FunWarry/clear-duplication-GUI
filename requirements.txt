@@ -3,3 +3,4 @@ pygame
 mutagen
 send2trash
 pyacoustid==1.2.2
+tksheet
