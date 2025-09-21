@@ -1,0 +1,52 @@
+PolyForm Noncommercial License 1.0.0
+===================================
+
+Acceptance
+In order to get any license under these terms, you must agree to them as both a condition and an obligation of receiving the license.
+
+Copyright License
+The licensor grants you a copyright license to do everything you might do with the software that would otherwise infringe the licensor’s copyright in it, for any noncommercial purpose. However, you may only distribute the software according to the terms of the Distribution License below.
+
+Distribution License
+The licensor grants you an additional copyright license to distribute copies of the software, with or without changes, for any noncommercial purpose, provided that you (a) include a complete copy of this license with every copy of the software you distribute, and (b) do not make any contractual offers, assurances, guarantees, or other commitments that create liability for the licensor or for any contributors to the software.
+
+Patent License
+The licensor grants you a patent license for the software that covers patent claims the licensor can license, or becomes able to license, that you would infringe by using the software.
+
+Noncommercial Purposes
+A noncommercial purpose is one that is not intended for or directed towards commercial advantage or monetary compensation. Noncommercial purposes include (by way of example, not limitation) personal use, academic research, teaching, public interest experimentation, and contributing to open source projects released under OSI-approved or FSF Free/Libre licenses.
+
+Commercial Purposes
+You may NOT use the software for Commercial Purposes under this license. To do so, you must obtain a separate commercial license from the licensor. Commercial Purposes include (by way of non‑limiting example): providing services, hosting, SaaS, paid distribution, internal business process enablement, resale, or any activity intended to generate revenue or commercial value directly or indirectly.
+
+Notices
+You must keep all copyright, patent, trademark, and attribution notices intact (including this license text) in all copies of the software that you distribute.
+
+No Other Rights
+These terms do not give you any right in any trademark, logo, or name of the licensor or any contributor. No sublicensing. No transfer except as expressly allowed by law.
+
+Patent Defense
+If you make any written claim that the software infringes or contributes to infringement of any patent, your patent license for the software granted under these terms ends immediately.
+
+Violations
+If you violate any of these terms, or do anything with the software not covered by your licenses, all your licenses granted under these terms end immediately.
+
+No Liability
+As far as the law allows, the software comes AS IS, WITHOUT ANY WARRANTY OR CONDITION, and the licensor will not be liable to you for any damages arising out of these terms or the use or nature of the software, under any kind of legal claim.
+
+Definitions
+The "licensor" is the individual or entity offering the software under these terms.
+The "software" is the software the licensor makes available under these terms.
+"You" refers to the individual or entity exercising permissions granted by this license.
+"Your company" means the organization you work for, plus all organizations that have control over, are under the control of, or are under common control with that organization. Control means ownership of substantially all the assets of an entity, or the power to direct its management and policies by vote, contract, or otherwise. Control may be direct or indirect.
+
+Source & Reference
+The canonical text of this license is published at:
+https://polyformproject.org/licenses/noncommercial/1.0.0/
+If this file differs in any way from the canonical text, the canonical text prevails.
+
+Commercial Licensing
+For commercial use, please contact: contact@votre-domaine.com
+Provide: company name, intended usage (SaaS / redistribution / internal tooling), approximate user base / scale.
+
+END OF LICENSE
